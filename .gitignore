@@ -1,0 +1,32 @@
+# Datasets, generated assets, and trained weights — too large / not source
+data/
+outputs/
+checkpoints/
+
+# Internal notes, planning, research — not part of the public surface
+lessons/
+.legacy/
+handoff_briefing.md
+project_state_*.md
+research_*.md
+zimage-style-adapter-plan.md
+
+# Editor / agent state
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs / scratch
+*.log
+*.tmp
