@@ -134,13 +134,22 @@ LR_DECAY_FLOOR = float(os.environ.get("LR_DECAY_FLOOR", "0.1"))
 # from peak to peak/10 over (STEPS - WARMUP) steps. The previous schedule
 # held LR at peak indefinitely after warmup, which let fast-growing blocks
 # keep accelerating throughout training.
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "wikimedia_train")
+DATA_DIR = os.environ.get(
+    "DATA_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "data", "wikimedia_train"),
+)
+# Where the per-step image augmentation reads JPEGs from. Override via env to
+# train on a different dataset (must contain the same filenames as referenced
+# in the cache file's `name` keys).
 CAPTION_PATH = os.path.join(DATA_DIR, "captions.json")
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoints")
 RUN_NAME = os.environ.get("RUN_NAME", "phase5_lora")
 LOSS_LOG_PATH = os.path.join(OUT_DIR, f"{RUN_NAME}_loss.txt")
 VAL_LOG_PATH = os.path.join(OUT_DIR, f"{RUN_NAME}_val.txt")
-CACHE_PATH = os.path.join(OUT_DIR, "phase4_pre_cache.pt")  # reuse phase 4 cache
+CACHE_PATH = os.environ.get(
+    "CACHE_PATH",
+    os.path.join(OUT_DIR, "phase4_pre_cache.pt"),  # reuse phase 4 cache by default
+)
 SEED = 0
 TRANSFORMER_DIM = 3840
 CSD_DIM = 768

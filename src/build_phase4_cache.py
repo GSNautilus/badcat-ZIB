@@ -36,11 +36,22 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 HEIGHT = 512
 WIDTH = 512
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "wikimedia_train")
-CAPTION_PATH = os.path.join(DATA_DIR, "captions.json")
-OUT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "checkpoints", "phase4_pre_cache.pt"
+DATA_DIR = os.environ.get(
+    "DATA_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "data", "wikimedia_train"),
 )
+CAPTION_PATH = os.path.join(DATA_DIR, "captions.json")
+OUT_PATH = os.environ.get(
+    "CACHE_PATH",
+    os.path.join(
+        os.path.dirname(__file__), "..", "checkpoints", "phase4_pre_cache.pt"
+    ),
+)
+# Override DATA_DIR / CACHE_PATH via env to build a cache for a different
+# dataset. The cache file is the source of truth for what train_phase5.py
+# operates on (per-image latents + caption features + CSD vectors); the
+# JPEGs in DATA_DIR are read again at training time only for the per-step
+# random-crop augmentation.
 
 
 class CSD_CLIP(nn.Module, PyTorchModelHubMixin):
