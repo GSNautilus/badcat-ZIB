@@ -108,6 +108,13 @@ USE_DUAL_TIME = os.environ.get("USE_DUAL_TIME", "0") == "1"
 # we want to test it again.
 STYLE_DROPOUT_PROB = float(os.environ.get("STYLE_DROPOUT_PROB", "0.10"))
 USE_GRADIENT_CHECKPOINTING = os.environ.get("USE_GRADIENT_CHECKPOINTING", "1") == "1"
+USE_NF4 = os.environ.get("USE_NF4", "1") == "1"
+# When True (default), load Z-Image-Base with 4-bit NF4 quantization. Required
+# for the 12 GB RTX 3060. When False, load the trunk in DTYPE (bf16) directly
+# — saves the per-matmul dequantization cost (~10-20% faster per step) but
+# uses ~9 GB more VRAM (3 GB quantized vs 12.3 GB bf16). Override to "0" on
+# 20-24 GB cards (e.g. A4500). On exactly 20 GB, you may still want
+# gradient checkpointing on; on 24 GB+ both can be off.
 LORA_RANK = int(os.environ.get("LORA_RANK", "32"))
 LORA_LR_RATIO = float(os.environ.get("LORA_LR_RATIO", "0.25"))
 # Multiplier applied to LR for the LoRA param group. Projector keeps LR;
@@ -271,6 +278,7 @@ def main():
           f"STYLE_ROPE_CONVENTION={STYLE_ROPE_CONVENTION!r}  "
           f"USE_DUAL_TIME={USE_DUAL_TIME}  "
           f"STYLE_DROPOUT_PROB={STYLE_DROPOUT_PROB}  "
+          f"USE_NF4={USE_NF4}  "
           f"USE_GRADIENT_CHECKPOINTING={USE_GRADIENT_CHECKPOINTING}  "
           f"LORA_RANK={LORA_RANK}  LORA_LR_RATIO={LORA_LR_RATIO}  "
           f"LR_DECAY_FLOOR={LR_DECAY_FLOOR}")
@@ -286,14 +294,21 @@ def main():
     print(f"Bridge: R shape={tuple(R_bridge.shape)}, dtype={R_bridge.dtype}, frozen")
 
     # ── load training models ─────────────────────────────────────
-    print("Loading transformer (Z-Image Base, NF4)...")
-    nf4 = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=DTYPE
-    )
-    transformer = ZImageTransformer2DModel.from_pretrained(
-        BASE_MODEL, subfolder="transformer",
-        quantization_config=nf4, torch_dtype=DTYPE,
-    ).to(DEVICE)
+    if USE_NF4:
+        print(f"Loading transformer (Z-Image Base, NF4 quantized)...")
+        nf4 = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=DTYPE
+        )
+        transformer = ZImageTransformer2DModel.from_pretrained(
+            BASE_MODEL, subfolder="transformer",
+            quantization_config=nf4, torch_dtype=DTYPE,
+        ).to(DEVICE)
+    else:
+        print(f"Loading transformer (Z-Image Base, full {DTYPE} — no NF4)...")
+        transformer = ZImageTransformer2DModel.from_pretrained(
+            BASE_MODEL, subfolder="transformer",
+            torch_dtype=DTYPE,
+        ).to(DEVICE)
     transformer.requires_grad_(False)
     transformer.train()
     if USE_GRADIENT_CHECKPOINTING:

@@ -62,7 +62,7 @@ BADCAT_DEBUG = True
 # change inference-side RoPE without matching training, so they're useful for
 # probing artifact mechanisms but no checkpoint was trained for them.
 BADCAT_DEGENERATE_STYLE_ROPE = False
-BADCAT_OFFSET_STYLE_ROPE = False
+BADCAT_OFFSET_STYLE_ROPE = True
 # CENTERED: like DEGENERATE but with spatial = (image_h_patched/2, image_w_patched/2)
 # instead of (0,0). Same mechanism (all style tokens at one point) — center
 # image position attends to style with zero spatial-RoPE distance, so style
