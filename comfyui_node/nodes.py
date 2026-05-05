@@ -19,7 +19,11 @@ import torch
 from PIL import Image
 import numpy as np
 
-from .style_adapter import StyleEmbedder
+from .style_adapter import (
+    StyleEmbedder,
+    BlockLoRAStack,
+    detect_checkpoint_format,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +114,18 @@ BADCAT_HALTON_STYLE_ROPE = False
 # contribution. Trade-off when this is True: CFG can't be used to control
 # style strength via cfg_scale.
 BADCAT_DISABLE_CFG_MASK = False
+
+# BLOCK-MASK: when masking style at excluded blocks (start_block > 0), do we
+# hide style keys from ALL queries at that block, or only from image queries?
+# True (default) → every query (image + caption + style) at the excluded block
+#   has style keys masked out. Cleaner semantics: at this block, style is fully
+#   inert, including style-self-update.
+# False → only image queries are blocked from attending to style keys at
+#   excluded blocks. Caption and style queries can still see style keys.
+#   Tests whether image-token caption-anchor competition specifically benefits
+#   from blocking style at certain blocks, leaving caption/style cross-talk
+#   intact.
+BADCAT_BLOCK_MASK_ALL_QUERIES = True
 
 
 def _log(msg: str) -> None:
@@ -215,9 +231,42 @@ class BadcatLoadZImageStyleAdapter:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Style adapter weights not found: {adapter_path}")
 
+        # Phase 5 checkpoints contain a `format` key plus extra dicts. Phase 4
+        # and earlier are flat StyleEmbedder state dicts. Pickled torch dicts
+        # may contain non-tensor metadata in phase 5, so weights_only=False is
+        # needed for those — phase 4 still loads cleanly under that mode.
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        ckpt_format = detect_checkpoint_format(state)
+
         embedder = StyleEmbedder(in_dim=in_dim, out_dim=out_dim)
-        state = torch.load(path, map_location="cpu", weights_only=True)
-        embedder.load_state_dict(state)
+        block_lora = None  # populated only for phase 5
+        config = {}
+
+        if ckpt_format == "phase5":
+            config = state.get("config", {})
+            embedder.load_state_dict(state["projector"])
+            block_lora = BlockLoRAStack(
+                num_blocks=config.get("num_blocks", 30),
+                dim=config.get("dim", out_dim),
+                rank=config.get("lora_rank", 32),
+            )
+            # strict=False lets us load older phase 5 checkpoints that
+            # predate the per-block gate parameter — those checkpoints don't
+            # have `layers.{i}.gate` keys, so they fall back to the init
+            # value 1.0 set in QKLoRAPair.__init__. Functionally equivalent
+            # to a vanilla LoRA. Newer checkpoints with trained gates load
+            # the trained values normally.
+            missing, unexpected = block_lora.load_state_dict(
+                state["lora"], strict=False
+            )
+            if BADCAT_DEBUG and (missing or unexpected):
+                _log(f"  lora load: missing={list(missing)[:3]}... "
+                     f"({len(missing)} total) unexpected={list(unexpected)[:3]}... "
+                     f"({len(unexpected)} total)")
+            block_lora = block_lora.to(dtype=torch_dtype).eval()
+        else:
+            embedder.load_state_dict(state)
+
         embedder = embedder.to(dtype=torch_dtype).eval()
 
         if BADCAT_DEBUG:
@@ -227,17 +276,46 @@ class BadcatLoadZImageStyleAdapter:
                 _log(f"LOAD adapter input='{adapter_path}'")
                 _log(f"  resolved path: {path}")
                 _log(f"  file: size={st.st_size} bytes, mtime={mtime}")
-                _log(f"  dtype: {torch_dtype}")
+                _log(f"  dtype: {torch_dtype}  format: {ckpt_format}")
+                if ckpt_format == "phase5":
+                    _log(f"  config: {config}")
                 # Print stats from the *loaded embedder* (post-cast to torch_dtype),
                 # not from the raw state dict — this is what attention will see.
                 sd = embedder.state_dict()
                 for k in ("proj.weight", "proj.bias", "pad_token"):
                     if k in sd:
                         _log(f"  {k:14s} {_tensor_stats(sd[k])}")
+                if block_lora is not None:
+                    # Up-matrix norms tell us if the LoRA is meaningfully trained
+                    # (>0) or fresh-init (~0 → no architectural change at inference).
+                    q_up_norms = []
+                    k_up_norms = []
+                    for layer in block_lora.layers:
+                        q_up_norms.append(layer.q_up.weight.detach().float().norm().item())
+                        k_up_norms.append(layer.k_up.weight.detach().float().norm().item())
+                    import statistics
+                    _log(
+                        f"  lora q_up: "
+                        f"mean={statistics.mean(q_up_norms):.4f} "
+                        f"min={min(q_up_norms):.4f} max={max(q_up_norms):.4f}"
+                    )
+                    _log(
+                        f"  lora k_up: "
+                        f"mean={statistics.mean(k_up_norms):.4f} "
+                        f"min={min(k_up_norms):.4f} max={max(k_up_norms):.4f}"
+                    )
             except Exception as e:
                 _log(f"  (debug print failed: {e})")
 
-        return ({"embedder": embedder, "dtype": torch_dtype, "in_dim": in_dim, "out_dim": out_dim},)
+        return ({
+            "embedder": embedder,
+            "dtype": torch_dtype,
+            "in_dim": in_dim,
+            "out_dim": out_dim,
+            "format": ckpt_format,
+            "block_lora": block_lora,
+            "config": config,
+        },)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +470,194 @@ def _build_style_rope_positions(
     return pos
 
 
+def _install_block_wrappers(transformer) -> None:
+    """Install per-block forward wrappers on transformer.layers[i].
+
+    Each wrapper checks transformer._badcat_start_block at call time and, for
+    blocks i < start_block, modifies the attention mask passed into the genuine
+    forward to hide style-token positions. For blocks i >= start_block (or when
+    start_block == 0) the wrapper is a passthrough.
+
+    Idempotent: skips layers that already carry our marker, so calling this
+    repeatedly across apply() invocations doesn't stack wrappers.
+
+    The wrappers are persistent monkey-patches on the underlying transformer
+    layer objects (not on a ModelPatcher clone) because ComfyUI's
+    add_object_patch dot-path doesn't index into list attributes. Staleness in
+    non-style workflows is handled by the wrapper itself: it requires
+    transformer._badcat_layer_state to be present AND the incoming x's
+    sequence length to match state["total_S"]. Mismatch → passthrough.
+    """
+    layers = getattr(transformer, "layers", None)
+    if layers is None:
+        return
+
+    for block_idx, layer in enumerate(layers):
+        current_fwd = layer.forward
+        if getattr(current_fwd, "_is_badcat_layer_patch", False):
+            continue
+        layer._badcat_genuine_forward = current_fwd
+
+        def make_wrapper(idx, lyr):
+            def patched_fwd(*args, **kwargs):
+                genuine = lyr._badcat_genuine_forward
+
+                state = getattr(transformer, "_badcat_layer_state", None)
+                start_block = getattr(transformer, "_badcat_start_block", 0)
+
+                # Fast paths: no state, no gating, or active block.
+                if state is None or start_block <= 0 or idx >= start_block:
+                    return genuine(*args, **kwargs)
+
+                # Freshness check: state from a previous workflow run is stale
+                # if the current sequence length differs from the stashed one.
+                x = args[0] if len(args) > 0 else kwargs.get("x")
+                if x is None or x.shape[1] != state["total_S"]:
+                    return genuine(*args, **kwargs)
+
+                # Excluded block: clone & modify the attention mask to hide
+                # style-key columns from queries.
+                style_start = state["style_start"]
+                total_S = state["total_S"]
+                image_start = state["image_start"]
+
+                # Block forward signature is (x, x_mask, freqs_cis, adaln_input,
+                # ...) — see comfy/ldm/lumina/model.py. ComfyUI's NextDiT calls
+                # blocks positionally, so args[1] is the standard path.
+                use_kw = "x_mask" in kwargs
+                if use_kw:
+                    orig_mask = kwargs["x_mask"]
+                else:
+                    orig_mask = args[1] if len(args) >= 2 else None
+
+                bsz = x.shape[0]
+                dev = x.device
+
+                if BADCAT_BLOCK_MASK_ALL_QUERIES:
+                    if orig_mask is None:
+                        new_mask = torch.ones(
+                            (bsz, 1, 1, total_S), dtype=torch.bool, device=dev
+                        )
+                    else:
+                        new_mask = orig_mask.clone()
+                    new_mask[..., style_start:] = False
+                else:
+                    # Sequence order is [cap, image, style]. Image queries are
+                    # at rows [image_start, style_start). Mask only the
+                    # (image_query × style_key) cells so style-self-attention
+                    # is preserved through masked blocks (image queries can't
+                    # see style at this block, but style queries can still see
+                    # style keys, so style tokens don't decohere).
+                    if orig_mask is None:
+                        new_mask = torch.ones(
+                            (bsz, 1, total_S, total_S), dtype=torch.bool, device=dev
+                        )
+                    elif orig_mask.dim() == 4 and orig_mask.shape[2] == 1:
+                        new_mask = orig_mask.expand(-1, -1, total_S, -1).clone()
+                    else:
+                        new_mask = orig_mask.clone()
+                    new_mask[:, :, image_start:style_start, style_start:] = False
+
+                if use_kw:
+                    kwargs["x_mask"] = new_mask
+                    return genuine(*args, **kwargs)
+                args_list = list(args)
+                if len(args_list) >= 2:
+                    args_list[1] = new_mask
+                else:
+                    while len(args_list) < 2:
+                        args_list.append(None)
+                    args_list[1] = new_mask
+                return genuine(*tuple(args_list), **kwargs)
+
+            patched_fwd._is_badcat_layer_patch = True
+            patched_fwd._badcat_block_idx = idx
+            return patched_fwd
+
+        layer.forward = make_wrapper(block_idx, layer)
+
+
+def _remove_lora_hooks(transformer) -> None:
+    """Remove any previously-installed LoRA forward hooks on the transformer's
+    main blocks. Stash holds the PyTorch handles; we just call .remove() on
+    each. Safe to call when no hooks are installed (no-op)."""
+    handles = getattr(transformer, "_badcat_lora_handles", None)
+    if handles:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        del transformer._badcat_lora_handles
+    if hasattr(transformer, "_badcat_lora_stack"):
+        # Drop the reference so the LoRA module can be GC'd between runs that
+        # use different checkpoints. The hook closures hold their own refs,
+        # but those are gone after .remove() above.
+        del transformer._badcat_lora_stack
+
+
+def _install_lora_hooks(transformer, block_lora, dim: int) -> None:
+    """Register a forward hook on each main block's attention.qkv linear so
+    that LoRA Q and K deltas are added to the corresponding slices of the
+    fused QKV output.
+
+    The qkv linear computes [Q | K | V] in the last dim (each Q, K, V slice
+    has size `dim` for Z-Image where n_heads == n_kv_heads). The LoRA pair's
+    q_delta and k_delta produce additive corrections of shape (..., dim);
+    we add them to the [:, :dim] and [:, dim:2*dim] slices respectively. V
+    is unchanged (per the OminiControl recipe — V LoRA was found to be less
+    critical, and our training side mirrors that).
+
+    Hook is registered with prepend=False (default) so it runs after any
+    other hooks on this module. Returns a list of RemovableHandle objects
+    stashed on the transformer for later removal in _remove_lora_hooks.
+    """
+    layers = transformer.layers
+    if len(layers) != block_lora.num_blocks:
+        raise ValueError(
+            f"BlockLoRAStack has {block_lora.num_blocks} layers but transformer "
+            f"main layers count is {len(layers)}. Mismatch — checkpoint dim/blocks "
+            f"don't match this trunk."
+        )
+
+    handles = []
+
+    for layer, lora in zip(layers, block_lora.layers):
+        attn = layer.attention
+        qkv_module = attn.qkv
+
+        def make_hook(lora_module, q_dim):
+            def hook(module, args, output):
+                # args[0] is the input tensor x to qkv. The genuine `output`
+                # is shape (..., 3*q_dim) since n_heads == n_kv_heads here.
+                x = args[0]
+                q_delta = lora_module.q_delta(x).to(
+                    dtype=output.dtype, device=output.device
+                )
+                k_delta = lora_module.k_delta(x).to(
+                    dtype=output.dtype, device=output.device
+                )
+                # Out-of-place clone — the genuine output may be referenced
+                # elsewhere (autograd, residual stream cache).
+                new_output = output.clone()
+                new_output[..., :q_dim] = new_output[..., :q_dim] + q_delta
+                new_output[..., q_dim:2 * q_dim] = (
+                    new_output[..., q_dim:2 * q_dim] + k_delta
+                )
+                return new_output
+            return hook
+
+        h = qkv_module.register_forward_hook(make_hook(lora, dim))
+        handles.append(h)
+
+    # Stash both the handles (for removal) and the LoRA stack itself (so it
+    # doesn't get GC'd while hooks reference it via closure — the closures
+    # already hold refs, but the explicit stash makes ownership clear and
+    # gives _remove_lora_hooks a clean cleanup path).
+    transformer._badcat_lora_handles = handles
+    transformer._badcat_lora_stack = block_lora
+
+
 class BadcatApplyZImageStyleAdapter:
     @classmethod
     def INPUT_TYPES(cls):
@@ -401,7 +667,17 @@ class BadcatApplyZImageStyleAdapter:
                 "style_adapter": ("ZIMAGE_STYLE_ADAPTER",),
                 "siglip2": ("SIGLIP2",),
                 "reference_image": ("IMAGE",),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05}),
+                "start_block": ("INT", {
+                    "default": 0, "min": 0, "max": 29, "step": 1,
+                    "tooltip": (
+                        "First block index where style is allowed to act. "
+                        "0 = inject at all 30 blocks (current/default). "
+                        "K>0 = blocks [0..K-1] mask style keys; blocks [K..29] "
+                        "attend to style normally. Diagnostic for whether "
+                        "caption-anchor competition is per-block."
+                    ),
+                }),
             }
         }
 
@@ -426,7 +702,7 @@ class BadcatApplyZImageStyleAdapter:
         feats = hidden[:, : sig_H * sig_W].view(sig_H, sig_W, hidden.shape[-1]).to(dtype)
         return feats, sig_H, sig_W
 
-    def apply(self, model, style_adapter, siglip2, reference_image, strength):
+    def apply(self, model, style_adapter, siglip2, reference_image, strength, start_block=0):
         m = model.clone()
         transformer = _find_inner_transformer(m)
 
@@ -452,16 +728,54 @@ class BadcatApplyZImageStyleAdapter:
         if not already_patched:
             transformer._badcat_genuine_patchify_and_embed = current
 
+        # start_block lives on the transformer so the per-block wrappers
+        # installed below can read it at call time. Each apply() call refreshes
+        # the value on this transformer instance; older clones reading from
+        # this transformer would see the latest. Acceptable for diagnostic.
+        transformer._badcat_start_block = int(start_block)
+
+        # Install per-block forward wrappers (idempotent — checks marker and
+        # skips if already wrapped). When start_block == 0, wrappers are pure
+        # passthrough. They become active when start_block > 0 by reading
+        # _badcat_layer_state set by patched_patchify each forward pass.
+        _install_block_wrappers(transformer)
+
+        # Phase 5: install per-block LoRA hooks on each main attention's qkv
+        # linear if the loaded checkpoint includes a BlockLoRAStack. Always
+        # remove any previously-installed hooks first — the previous run may
+        # have used a different LoRA (or no LoRA, e.g. phase 4 checkpoint).
+        # Hooks must not stack across apply() invocations.
+        _remove_lora_hooks(transformer)
+        block_lora = style_adapter.get("block_lora")
+        if block_lora is not None:
+            block_lora = block_lora.to(device=device, dtype=target_dtype)
+            for p in block_lora.parameters():
+                p.requires_grad_(False)
+            _install_lora_hooks(transformer, block_lora,
+                                dim=int(style_adapter.get("out_dim", 3840)))
+
         if BADCAT_DEBUG:
             sd = embedder.state_dict()
+            ckpt_format = style_adapter.get("format", "phase4")
             _log(f"APPLY transformer={type(transformer).__name__} device={device} "
-                 f"dtype={target_dtype} strength={float(strength):.3f}")
+                 f"dtype={target_dtype} strength={float(strength):.3f} "
+                 f"start_block={int(start_block)} "
+                 f"block_mask_all_queries={BADCAT_BLOCK_MASK_ALL_QUERIES}  "
+                 f"ckpt_format={ckpt_format}")
             _log(f"  reference: PIL size={pil.size}, siglip grid={sig_H}x{sig_W}, "
                  f"siglip_feats {_tensor_stats(siglip_feats)}")
             _log(f"  embedder.proj.weight {_tensor_stats(sd['proj.weight'])}")
             _log(f"  embedder.proj.bias   {_tensor_stats(sd['proj.bias'])}")
             _log(f"  embedder.pad_token   {_tensor_stats(sd['pad_token'])}")
             _log(f"  patch state on entry: live patchify_and_embed is_badcat={already_patched}")
+            if block_lora is not None:
+                _log(f"  LoRA: installed on {block_lora.num_blocks} main blocks "
+                     f"(rank={block_lora.rank}, dim={block_lora.dim}); "
+                     f"hooks={len(getattr(transformer, '_badcat_lora_handles', []))}")
+            elif ckpt_format == "phase5":
+                _log(f"  LoRA: phase 5 ckpt but block_lora is None (?)")
+            else:
+                _log(f"  LoRA: not installed (phase 4 checkpoint)")
 
         rope_embedder = transformer.rope_embedder
         patch_size = transformer.patch_size
@@ -609,6 +923,26 @@ class BadcatApplyZImageStyleAdapter:
                 debug_state["printed_branches"].add((branch_key, "mask"))
                 _log(f"  mask path: {mask_path}, "
                      f"new_mask={'None' if new_mask is None else f'tensor shape={tuple(new_mask.shape)} dtype={new_mask.dtype}'}")
+
+            # Stash sequence layout for the per-block forward wrappers.
+            #
+            # Z-Image's _build_unified_sequence concatenates as [cap, image] in
+            # padded_full_embed (see comfy/ldm/lumina/model.py:793 — feats is
+            # cap_feats first, x is image, cat is feats + (x,)). Style tokens
+            # are appended at the end, so the unified sequence layout is:
+            #
+            #     [ 0 .. cap_padded_len )       — caption rows
+            #     [ cap_padded_len .. style_start )  — image rows
+            #     [ style_start .. total_S )    — style rows
+            #
+            # total_S is also used by the wrappers as a freshness check —
+            # mismatch on a non-style workflow run → wrapper falls through.
+            transformer._badcat_layer_state = {
+                "style_start": padded_full_embed.shape[1],
+                "total_S": new_padded.shape[1],
+                "cap_padded_len": int(cap_padded_len),
+                "image_start": int(cap_padded_len),
+            }
 
             return new_padded, new_mask, img_size, cap_size, new_freqs, timestep_zero_index
 

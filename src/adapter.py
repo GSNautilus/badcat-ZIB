@@ -15,13 +15,17 @@ Approach:
 from __future__ import annotations
 
 import contextlib
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from diffusers.models.normalization import RMSNorm
-from diffusers.models.transformers.transformer_z_image import SEQ_MULTI_OF
+from diffusers.models.transformers.transformer_z_image import (
+    SEQ_MULTI_OF,
+    ZSingleStreamAttnProcessor,
+)
 
 
 # RoPE convention for style tokens. See diagnosis in
@@ -380,3 +384,276 @@ def style_injection(
                 del transformer._style_dual_adaln_noisy
             if hasattr(transformer, "_style_dual_adaln_clean"):
                 del transformer._style_dual_adaln_clean
+
+
+# =============================================================================
+# Phase 5: per-block LoRA on Q, K projections of the trunk's main layers.
+# =============================================================================
+# Motivation: phase 4 demonstrated empirically (2026-05-04) that with the
+# pure-projector + sequence-concat architecture on the frozen Z-Image trunk,
+# the trained adapter's effective contribution is concentrated in the first
+# 2-3 of 30 main blocks. Masking blocks 0-2 entirely removes visible style;
+# masking blocks 3-29 has no observable effect. The trunk's frozen pretrained
+# Q projections are only receptive to OOD sequence-concat tokens at the very
+# first blocks. See conversation memory + research notes.
+#
+# Phase 5 addresses this by adding per-block LoRA on the to_q, to_k linear
+# layers. This is the OminiControl recipe (arxiv:2411.15098): instead of
+# adding new cross-attention layers (the SDXL/FLUX IP-Adapter pattern),
+# modify the trunk's existing attention via low-rank deltas so its Q/K
+# computation becomes receptive to OOD tokens at every block.
+#
+# OminiControl found Q, K LoRA was the load-bearing piece; V LoRA was less
+# critical. We follow that here. Rank=32 is the default starting point.
+#
+# The LoRA modules are trainable parameters that live in the adapter package
+# alongside the StyleEmbedder, NOT inside the transformer itself. The trunk
+# stays frozen; we attach LoRA at runtime via a context manager that swaps
+# each main block's attention processor for a LoRA-aware variant.
+
+class QKLoRAPair(nn.Module):
+    """Per-block LoRA on Q and K projections.
+
+    Output of forward isn't used directly — call q_delta(x) / k_delta(x) to
+    get the additive deltas applied to the genuine to_q(x) / to_k(x) outputs.
+    Up matrices are zero-initialized so the LoRA is a no-op until trained.
+
+    Per-block scalar `gate` is a learnable multiplier on the LoRA contribution.
+    Initialized at 1.0 so behavior at init matches a vanilla LoRA. The gate
+    exists to make per-block effective magnitude directly addressable by the
+    variance regularization loss in BlockLoRAStack — without it, the only
+    way to redistribute the per-block LoRA effective magnitude is through
+    growing/shrinking the up @ down product itself, which has more degrees
+    of freedom than needed and reacts more sluggishly to regularization
+    pressure.
+    """
+
+    def __init__(self, dim: int, rank: int = 32):
+        super().__init__()
+        self.dim = dim
+        self.rank = rank
+        self.q_down = nn.Linear(dim, rank, bias=False)
+        self.q_up = nn.Linear(rank, dim, bias=False)
+        self.k_down = nn.Linear(dim, rank, bias=False)
+        self.k_up = nn.Linear(rank, dim, bias=False)
+        # Per-block scalar gate, learnable, init 1.0 (no scaling at init).
+        self.gate = nn.Parameter(torch.ones(1))
+        # Kaiming on the down projections (standard LoRA init).
+        nn.init.kaiming_uniform_(self.q_down.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.k_down.weight, a=math.sqrt(5))
+        # Zero-init up: initial output is zero, so adding the LoRA delta is a
+        # no-op against the genuine to_q/to_k. Loss starts identical to the
+        # un-augmented trunk; gradient pressure determines how it grows.
+        nn.init.zeros_(self.q_up.weight)
+        nn.init.zeros_(self.k_up.weight)
+
+    def q_delta(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate * self.q_up(self.q_down(x))
+
+    def k_delta(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate * self.k_up(self.k_down(x))
+
+    def effective_q_norm_sq(self) -> torch.Tensor:
+        """Squared Frobenius norm of the effective Q delta matrix.
+
+        Equivalent to ||gate * q_up @ q_down||_F^2, but computed without
+        materializing the rank-32 product matrix (which would be (dim, dim)).
+        Uses the gram-trace identity: for symmetric A_g = A^T A and
+        B_g = B B^T, ||A B||_F^2 = trace(A_g B_g) = (A_g * B_g).sum().
+        """
+        A = self.q_up.weight  # (dim, rank)
+        B = self.q_down.weight  # (rank, dim)
+        A_g = A.T @ A  # (rank, rank), symmetric
+        B_g = B @ B.T  # (rank, rank), symmetric
+        return self.gate.pow(2).squeeze() * (A_g * B_g).sum()
+
+    def effective_k_norm_sq(self) -> torch.Tensor:
+        A = self.k_up.weight
+        B = self.k_down.weight
+        A_g = A.T @ A
+        B_g = B @ B.T
+        return self.gate.pow(2).squeeze() * (A_g * B_g).sum()
+
+
+class BlockLoRAStack(nn.Module):
+    """A ModuleList of QKLoRAPair, one per main transformer block.
+
+    For Z-Image-Base, num_blocks=30, dim=3840. At rank=32 this is ~14.7M
+    trainable params total + 30 scalar gates — same order of magnitude as
+    the StyleEmbedder.
+    """
+
+    def __init__(self, num_blocks: int = 30, dim: int = 3840, rank: int = 32):
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.dim = dim
+        self.rank = rank
+        self.layers = nn.ModuleList(
+            [QKLoRAPair(dim=dim, rank=rank) for _ in range(num_blocks)]
+        )
+
+    def __getitem__(self, idx: int) -> QKLoRAPair:
+        return self.layers[idx]
+
+    def variance_reg_loss(self, eps: float = 1e-12) -> torch.Tensor:
+        """Variance of effective per-block LoRA magnitudes.
+
+        For each block, computes the Frobenius norm of the effective Q and K
+        delta matrices (gate × up @ down). Returns the variance across blocks
+        of these magnitudes — minimized when all blocks contribute equally.
+
+        Pressure direction: outlier blocks (much larger than mean) get pushed
+        down; small blocks get pushed up. This is the load-bearing fix for
+        phase 5's failure mode where vanilla LoRA's gradient asymmetry caused
+        early/late blocks to monopolize contribution while middle blocks
+        languished. With this regularization, the optimizer has explicit
+        gradient pressure to redistribute toward uniform per-block magnitude.
+
+        Computed in float32 for numerical stability — the squared norms can
+        span several orders of magnitude across blocks during training, and
+        bf16 variance can underflow at the small-blocks end.
+
+        The `eps` inside sqrt is critical for the zero-init regime: at step 0
+        all up matrices are zero, so norm_sq = 0; without eps, the derivative
+        d sqrt(0) = 1/(2·sqrt(0)) = inf would flow back through the up/down
+        matrices and corrupt the optimizer state. With eps=1e-12, the sqrt
+        is well-defined at init and the variance starts cleanly at 0
+        (all blocks have sqrt(eps) ≈ 1e-6, equal). Once any block grows
+        past sqrt(eps), the eps becomes negligible.
+        """
+        q_norms = torch.stack(
+            [(l.effective_q_norm_sq() + eps).sqrt() for l in self.layers]
+        ).float()
+        k_norms = torch.stack(
+            [(l.effective_k_norm_sq() + eps).sqrt() for l in self.layers]
+        ).float()
+        return q_norms.var() + k_norms.var()
+
+
+class LoRAAwareAttnProcessor(ZSingleStreamAttnProcessor):
+    """Drop-in replacement for ZSingleStreamAttnProcessor that adds LoRA
+    deltas to to_q and to_k outputs.
+
+    Reads the LoRA module from `attn._badcat_lora` if present; if absent,
+    behaves identically to the genuine processor. We set _badcat_lora on
+    each main block's attention from the lora_injection context manager
+    and clear it on exit, so this processor reverts to no-op behavior
+    when LoRA isn't installed.
+    """
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        freqs_cis: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Genuine Q, K, V from the frozen trunk's projections.
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        # LoRA deltas: only added if a LoRA module is attached for this attn.
+        lora = getattr(attn, "_badcat_lora", None)
+        if lora is not None:
+            query = query + lora.q_delta(hidden_states)
+            key = key + lora.k_delta(hidden_states)
+
+        # Match the rest of ZSingleStreamAttnProcessor.__call__ exactly.
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # Apply RoPE — copied from the genuine processor.
+        def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+            with torch.amp.autocast("cuda", enabled=False):
+                x = torch.view_as_complex(
+                    x_in.float().reshape(*x_in.shape[:-1], -1, 2)
+                )
+                freqs_cis = freqs_cis.unsqueeze(2)
+                x_out = torch.view_as_real(x * freqs_cis).flatten(3)
+                return x_out.type_as(x_in)
+
+        if freqs_cis is not None:
+            query = apply_rotary_emb(query, freqs_cis)
+            key = apply_rotary_emb(key, freqs_cis)
+
+        dtype = query.dtype
+        query, key = query.to(dtype), key.to(dtype)
+
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+
+        # The genuine processor calls dispatch_attention_fn — we need the same.
+        from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(dtype)
+
+        output = attn.to_out[0](hidden_states)
+        if len(attn.to_out) > 1:
+            output = attn.to_out[1](output)
+
+        return output
+
+
+@contextlib.contextmanager
+def lora_injection(transformer, block_lora: BlockLoRAStack):
+    """Install per-block LoRA on the transformer's main layers' attention.
+
+    On entry: for each of the 30 main layers, attach the corresponding
+    QKLoRAPair to that layer's attention as `_badcat_lora`, and swap the
+    attention processor to LoRAAwareAttnProcessor. The genuine processor
+    is stashed and restored on exit. The base transformer parameters are
+    unchanged; only `attn.processor` and `attn._badcat_lora` are touched.
+
+    Compose with style_injection — typically you want both:
+
+        with lora_injection(transformer, block_lora):
+            with style_injection(transformer, ..., drop_style=...):
+                pred = transformer(...)
+
+    The LoRA stays active during style_injection's drop_style branch. This
+    is intentional: during style-dropout training steps, the LoRA receives
+    gradient pressure to NOT modify attention since there's no style for
+    its modifications to help with. Combined with the ~90% style-present
+    pressure to BE active, the LoRA learns deltas that are useful when
+    style is in the sequence and small when it isn't.
+    """
+    layers = transformer.layers
+    if len(layers) != block_lora.num_blocks:
+        raise ValueError(
+            f"BlockLoRAStack has {block_lora.num_blocks} layers but transformer "
+            f"has {len(layers)} main layers — they must match."
+        )
+
+    saved_processors = []
+    try:
+        for i, layer in enumerate(layers):
+            attn = layer.attention
+            saved_processors.append((attn, attn.processor))
+            attn._badcat_lora = block_lora[i]
+            attn.processor = LoRAAwareAttnProcessor()
+        yield
+    finally:
+        for attn, original_processor in saved_processors:
+            attn.processor = original_processor
+            if hasattr(attn, "_badcat_lora"):
+                del attn._badcat_lora
