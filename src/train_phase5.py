@@ -402,7 +402,10 @@ def main():
 
         entry = train_data[rng.randrange(len(train_data))]
 
-        ref_pil = Image.open(entry["raw_path"]).convert("RGB")
+        # The cache stores `raw_path` as the absolute path on the machine
+        # where it was built. Use entry["name"] + local DATA_DIR instead so
+        # the cache is portable across machines (e.g. 3060 -> A4500).
+        ref_pil = Image.open(os.path.join(DATA_DIR, entry["name"])).convert("RGB")
         aug_ref = augment_reference(ref_pil, rng)
         siglip_feats, sig_H, sig_W = encode_siglip(
             siglip, processor, aug_ref, DEVICE, DTYPE
@@ -518,7 +521,9 @@ def main():
             val_gen = torch.Generator(device=DEVICE).manual_seed(SEED + 1)
             with torch.no_grad():
                 for ventry in train_data:
-                    ref_pil_v = Image.open(ventry["raw_path"]).convert("RGB")
+                    ref_pil_v = Image.open(
+                        os.path.join(DATA_DIR, ventry["name"])
+                    ).convert("RGB")
                     work = ref_pil_v.resize((512, 512), Image.LANCZOS)
                     crop_size = int(512 * 0.7)
                     pad = (512 - crop_size) // 2
