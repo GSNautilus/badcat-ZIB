@@ -621,12 +621,16 @@ def _install_lora_hooks(transformer, block_lora, dim: int) -> None:
         )
 
     handles = []
+    # DIAGNOSTIC: per-block fire counter. Reset on each install so a stale
+    # counter from a previous sampling pass doesn't confuse interpretation.
+    transformer._badcat_lora_fire_count = [0] * len(layers)
+    transformer._badcat_lora_last_norms = [None] * len(layers)
 
-    for layer, lora in zip(layers, block_lora.layers):
+    for block_idx, (layer, lora) in enumerate(zip(layers, block_lora.layers)):
         attn = layer.attention
         qkv_module = attn.qkv
 
-        def make_hook(lora_module, q_dim):
+        def make_hook(lora_module, q_dim, blk_idx):
             def hook(module, args, output):
                 # args[0] is the input tensor x to qkv. The genuine `output`
                 # is shape (..., 3*q_dim) since n_heads == n_kv_heads here.
@@ -637,6 +641,28 @@ def _install_lora_hooks(transformer, block_lora, dim: int) -> None:
                 k_delta = lora_module.k_delta(x).to(
                     dtype=output.dtype, device=output.device
                 )
+                # DIAGNOSTIC: track that the hook fired on this block, plus the
+                # actual delta magnitude vs the genuine Q/K slice on this real
+                # inference input. First-fire on each block prints to stdout so
+                # we can verify hooks fire AND see the realised perturbation.
+                transformer._badcat_lora_fire_count[blk_idx] += 1
+                if transformer._badcat_lora_fire_count[blk_idx] == 1:
+                    with torch.no_grad():
+                        q_genuine = output[..., :q_dim]
+                        k_genuine = output[..., q_dim:2 * q_dim]
+                        q_pct = 100.0 * q_delta.float().norm().item() / max(
+                            q_genuine.float().norm().item(), 1e-12)
+                        k_pct = 100.0 * k_delta.float().norm().item() / max(
+                            k_genuine.float().norm().item(), 1e-12)
+                        x_norm = x.float().norm().item()
+                    transformer._badcat_lora_last_norms[blk_idx] = (q_pct, k_pct, x_norm)
+                    print(f"[badcat-lora-hook] blk={blk_idx:2d} FIRED  "
+                          f"x.shape={tuple(x.shape)}  ||x||={x_norm:.2f}  "
+                          f"||q_delta||={q_delta.float().norm().item():.2f} "
+                          f"({q_pct:.2f}% of genuine Q)  "
+                          f"||k_delta||={k_delta.float().norm().item():.2f} "
+                          f"({k_pct:.2f}% of genuine K)",
+                          flush=True)
                 # Out-of-place clone — the genuine output may be referenced
                 # elsewhere (autograd, residual stream cache).
                 new_output = output.clone()
@@ -647,7 +673,7 @@ def _install_lora_hooks(transformer, block_lora, dim: int) -> None:
                 return new_output
             return hook
 
-        h = qkv_module.register_forward_hook(make_hook(lora, dim))
+        h = qkv_module.register_forward_hook(make_hook(lora, dim, block_idx))
         handles.append(h)
 
     # Stash both the handles (for removal) and the LoRA stack itself (so it
@@ -678,6 +704,18 @@ class BadcatApplyZImageStyleAdapter:
                         "caption-anchor competition is per-block."
                     ),
                 }),
+                "gate_amplify": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1,
+                    "tooltip": (
+                        "Multiplies all per-block LoRA gates at inference. "
+                        "Phase 5+ checkpoints only; ignored for phase 4. "
+                        "1.0 = trained gates as-is (production). "
+                        "0.0 = LoRA fully off (phase-4-equivalent baseline). "
+                        ">1.0 = amplify trained LoRA's perturbation. "
+                        "Diagnostic: tests whether LoRA's direction is useful "
+                        "but its trained magnitude was the bottleneck."
+                    ),
+                }),
             }
         }
 
@@ -702,7 +740,7 @@ class BadcatApplyZImageStyleAdapter:
         feats = hidden[:, : sig_H * sig_W].view(sig_H, sig_W, hidden.shape[-1]).to(dtype)
         return feats, sig_H, sig_W
 
-    def apply(self, model, style_adapter, siglip2, reference_image, strength, start_block=0):
+    def apply(self, model, style_adapter, siglip2, reference_image, strength, start_block=0, gate_amplify=1.0):
         m = model.clone()
         transformer = _find_inner_transformer(m)
 
@@ -751,6 +789,51 @@ class BadcatApplyZImageStyleAdapter:
             block_lora = block_lora.to(device=device, dtype=target_dtype)
             for p in block_lora.parameters():
                 p.requires_grad_(False)
+            # DIAGNOSTIC: gate amplification. Multiplies trained gate values by
+            # gate_amplify (node input). At 10 we test whether the LoRA's
+            # direction is useful — visible style change → direction works,
+            # magnitude was the bottleneck. Output unchanged → LoRA learned
+            # noise. At 0, LoRA is fully off (phase-4-equivalent baseline).
+            #
+            # Idempotency: ComfyUI caches the loader output, so block_lora is
+            # the SAME instance across apply() invocations. We stash the trained
+            # gates on first sight, then on every apply() restore originals
+            # before re-multiplying. This makes the slider's effect deterministic
+            # regardless of how many times apply() runs.
+            gate_mul = float(gate_amplify)
+            with torch.no_grad():
+                if not hasattr(block_lora, "_badcat_orig_gates"):
+                    block_lora._badcat_orig_gates = [
+                        layer.gate.data.detach().clone()
+                        for layer in block_lora.layers
+                    ]
+                for layer, orig in zip(
+                    block_lora.layers, block_lora._badcat_orig_gates
+                ):
+                    layer.gate.data.copy_(orig)
+                if gate_mul != 1.0:
+                    for layer in block_lora.layers:
+                        layer.gate.data.mul_(gate_mul)
+            if gate_mul != 1.0:
+                print(f"[badcat-diag] GATE AMPLIFICATION: trained gates × "
+                      f"{gate_mul:.2f}  "
+                      f"(post-mult gate[0]={float(block_lora.layers[0].gate.data.item()):.3f})",
+                      flush=True)
+            # DIAGNOSTIC: capture qkv module IDs at apply-time so we can compare
+            # to the IDs at sample-time and confirm whether ComfyUI/GGUF swaps
+            # them between the two phases.
+            transformer._badcat_apply_time_qkv_ids = [
+                id(layer.attention.qkv) for layer in transformer.layers
+            ]
+            print(f"[badcat-diag] APPLY-TIME qkv ids[0:3] = "
+                  f"{transformer._badcat_apply_time_qkv_ids[0:3]} "
+                  f"(types: {[type(layer.attention.qkv).__name__ for layer in transformer.layers[:3]]})",
+                  flush=True)
+            # Stash the lora stack for lazy install at first sample-time call.
+            transformer._badcat_lora_stack = block_lora
+            transformer._badcat_lora_dim = int(style_adapter.get("out_dim", 3840))
+            transformer._badcat_lora_hooks_installed = False
+            # Original eager install — kept for the apply-time path.
             _install_lora_hooks(transformer, block_lora,
                                 dim=int(style_adapter.get("out_dim", 3840)))
 
@@ -794,6 +877,44 @@ class BadcatApplyZImageStyleAdapter:
             # Always call the stashed genuine — never the live attribute, which
             # may be another (older) wrap.
             genuine = transformer._badcat_genuine_patchify_and_embed
+
+            # DIAGNOSTIC: at the FIRST sample-time call, compare the live qkv
+            # module IDs to the ones we recorded at apply-time. If they differ,
+            # ComfyUI swapped modules between apply() and sampling — and any
+            # hooks we registered at apply-time are dead. Install fresh hooks
+            # on the live modules (the ones actually being used now).
+            if not getattr(transformer, "_badcat_lora_diag_printed", False):
+                transformer._badcat_lora_diag_printed = True
+                stash = getattr(transformer, "_badcat_lora_stack", None)
+                if stash is not None:
+                    apply_ids = getattr(transformer, "_badcat_apply_time_qkv_ids", [])
+                    sample_ids = [id(layer.attention.qkv) for layer in transformer.layers]
+                    n_diff = sum(1 for a, s in zip(apply_ids, sample_ids) if a != s)
+                    print(f"[badcat-diag] SAMPLE-TIME qkv ids[0:3] = {sample_ids[0:3]} "
+                          f"(types: {[type(layer.attention.qkv).__name__ for layer in transformer.layers[:3]]})",
+                          flush=True)
+                    print(f"[badcat-diag] qkv module identity check: "
+                          f"{n_diff}/{len(apply_ids)} blocks have DIFFERENT "
+                          f"qkv instances at sample-time vs apply-time",
+                          flush=True)
+                    if n_diff > 0:
+                        # Modules were swapped → original hooks are dead. Install
+                        # fresh ones on the live modules NOW.
+                        print(f"[badcat-diag] LIFECYCLE BUG CONFIRMED: re-installing "
+                              f"LoRA hooks on live sample-time modules", flush=True)
+                        # Drop the old (dead) handles silently — they're attached
+                        # to module instances no longer in use.
+                        if hasattr(transformer, "_badcat_lora_handles"):
+                            for h in transformer._badcat_lora_handles:
+                                try: h.remove()
+                                except Exception: pass
+                            del transformer._badcat_lora_handles
+                        _install_lora_hooks(transformer, stash,
+                                            dim=transformer._badcat_lora_dim)
+                        print(f"[badcat-diag] re-install complete: "
+                              f"hooks={len(transformer._badcat_lora_handles)}",
+                              flush=True)
+
             padded_full_embed, mask, img_size, cap_size, freqs_cis, timestep_zero_index = genuine(
                 *args, **kwargs
             )
