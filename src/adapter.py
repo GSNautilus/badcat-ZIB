@@ -300,6 +300,11 @@ def style_injection(
         unified_freqs = torch.cat(
             [x_freqs[0][:x_len], cap_freqs[0][:cap_len], style_freqs]
         ).unsqueeze(0)
+        # Stash sequence layout for downstream consumers (style_attention_block_mask).
+        # Layout is [image (x_len) | cap (cap_len) | style (style_seqlen)]; cleared
+        # on style_injection exit. Read lazily by per-block forward wrappers so they
+        # can construct masks against this exact layout regardless of sequence size.
+        transformer._badcat_seq_lens = (int(x_len), int(cap_len), int(style_seqlen))
         if use_dual_time:
             # 1 = noisy (x + cap), 0 = clean (style). Matches the convention in
             # ZImageTransformerBlock.select_per_token (noisy=1 picks adaln_noisy).
@@ -384,6 +389,8 @@ def style_injection(
                 del transformer._style_dual_adaln_noisy
             if hasattr(transformer, "_style_dual_adaln_clean"):
                 del transformer._style_dual_adaln_clean
+        if hasattr(transformer, "_badcat_seq_lens"):
+            del transformer._badcat_seq_lens
 
 
 # =============================================================================
@@ -657,3 +664,101 @@ def lora_injection(transformer, block_lora: BlockLoRAStack):
             attn.processor = original_processor
             if hasattr(attn, "_badcat_lora"):
                 del attn._badcat_lora
+
+
+@contextlib.contextmanager
+def style_attention_block_mask(
+    transformer,
+    active_mask: list[bool],
+):
+    """Per-block masking of image→style attention during training.
+
+    For each block where `active_mask[k]` is False, install a forward wrapper
+    that injects a 4D attention mask hiding image-query × style-key cells.
+    Caption→style and style→style attention are unaffected (only image queries
+    are blocked from seeing style at masked blocks).
+
+    This is the training-time analog of the inference-side `start_block`
+    diagnostic in comfyui_node/nodes.py:_install_block_wrappers, but with
+    arbitrary per-block selection rather than a single threshold.
+
+    Used by phase 5c training: at each step, sample `active_mask` with
+    independent Bernoulli(1-p_mask) for each block. The optimizer cannot
+    concentrate the LoRA's useful work at any specific blocks because any
+    specific blocks might be masked at any step. To reduce loss across all
+    mask configurations, every block must learn to contribute when called
+    upon.
+
+    Sequence layout (matches `style_injection` patched_build):
+        [image (x_len) | cap (cap_len) | style (style_len)]
+    Lengths are read at call time from `transformer._badcat_seq_lens`, which
+    `style_injection` stashes during patched_build. If absent (e.g. style
+    dropout, or this manager entered outside style_injection), wrappers fall
+    through to the genuine forward — masking only applies when style is
+    actually present.
+
+    Composes with `style_injection` and `lora_injection`:
+        with lora_injection(transformer, block_lora):
+            with style_injection(...):
+                with style_attention_block_mask(transformer, mask):
+                    pred = transformer(...)
+
+    Order matters: enter this AFTER style_injection so we wrap whatever
+    layer.forward style_injection's dual-time path may have installed. On
+    exit we restore the forward found at entry.
+    """
+    layers = transformer.layers
+    if len(active_mask) != len(layers):
+        raise ValueError(
+            f"active_mask has {len(active_mask)} entries but transformer "
+            f"has {len(layers)} main layers — they must match."
+        )
+
+    layer_patches = []
+
+    def make_wrapper(orig_fwd):
+        def wrapped(x, attn_mask, freqs_cis, *args, **kwargs):
+            seq_lens = getattr(transformer, "_badcat_seq_lens", None)
+            if seq_lens is None:
+                # No style in the sequence (e.g. drop_style step) — pass through.
+                return orig_fwd(x, attn_mask, freqs_cis, *args, **kwargs)
+            x_len, cap_len, style_len = seq_lens
+            total_S = x_len + cap_len + style_len
+            if x.shape[1] != total_S:
+                # Sequence length mismatch — defensive fallback.
+                return orig_fwd(x, attn_mask, freqs_cis, *args, **kwargs)
+            image_start = 0
+            image_end = x_len
+            style_start = x_len + cap_len
+            bsz = x.shape[0]
+            dev = x.device
+            # Build a fresh 4D mask if none was supplied (training default).
+            # Otherwise expand/clone the existing one to (B, 1, total_S, total_S).
+            if attn_mask is None:
+                new_mask = torch.ones(
+                    (bsz, 1, total_S, total_S), dtype=torch.bool, device=dev
+                )
+            elif attn_mask.dim() == 4 and attn_mask.shape[2] == 1:
+                new_mask = attn_mask.expand(-1, -1, total_S, -1).clone()
+            elif attn_mask.dim() == 2:
+                new_mask = attn_mask[:, None, None, :].expand(
+                    -1, -1, total_S, -1
+                ).clone()
+            else:
+                new_mask = attn_mask.clone()
+            # Hide image→style cells; leave caption→style and style→style alone.
+            new_mask[:, :, image_start:image_end, style_start:] = False
+            return orig_fwd(x, new_mask, freqs_cis, *args, **kwargs)
+        return wrapped
+
+    try:
+        for block_idx, layer in enumerate(layers):
+            if active_mask[block_idx]:
+                continue  # unmasked — image queries can see style normally
+            original_fwd = layer.forward
+            layer.forward = make_wrapper(original_fwd)
+            layer_patches.append((layer, original_fwd))
+        yield
+    finally:
+        for layer, original_fwd in layer_patches:
+            layer.forward = original_fwd
